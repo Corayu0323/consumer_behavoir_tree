@@ -1,19 +1,26 @@
-# macOS / IDE
-.DS_Store
+# 忽略 PyCharm 配置
 .idea/
-.vscode/
+cmake-build-debug/
+cmake-build-release/
 
-# Python
+# 忽略 Python 缓存
 __pycache__/
 *.pyc
-.venv/
+*.pyo
+*.pyd
+
+# 忽略虚拟环境
 venv/
+.venv/
+env/
 
-# Data (raw + processed)
-data/*.csv
-data/**/processed/
-data/**/*.parquet
-data/**/*.jsonl
-data/**/*.json
-data/**/*.csv
+# 忽略数据文件 (建议只保留目录结构，不传具体文件)
+data/UserBehavior.csv
+data/cluster_data/processed/
+results/*.csv
 
+# 忽略系统文件
+.DS_Store
+
+# 如果 readme 里的 PDF 是大型论文，也建议考虑是否必要上传
+# readme/*.pdf
