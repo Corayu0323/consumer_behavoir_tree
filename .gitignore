@@ -1,0 +1,19 @@
+# macOS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data (raw + processed)
+data/*.csv
+data/**/processed/
+data/**/*.parquet
+data/**/*.jsonl
+data/**/*.json
+data/**/*.csv
+
