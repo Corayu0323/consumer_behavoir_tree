@@ -4,6 +4,7 @@ OOD Detector for Bayesian Trie (Baseline)
 
 Definitions:
 - Hard OOD: a step transition is missing in Trie (path breaks)
+- Causal / Logic OOD: path exists but violates stage logic rules
 - Soft OOD: path exists, but anomaly score is high
     score S = sum_t -log P(x_t | prefix)
 
@@ -15,15 +16,13 @@ from __future__ import annotations
 
 import os
 import csv
-import time
-import math
 import json
 import argparse
 from dataclasses import dataclass
-from typing import Iterable, List, Tuple, Any, Dict, Optional
+from typing import Iterable, List, Tuple, Any
 
-from src.trie.trie import BayesianTrie, iter_user_sequences_jsonl
-from src.trie.node import step_to_key
+from src.trie.trie import BayesianTrie
+from src.ood.timing import perf_counter, elapsed_ms, summarize
 
 
 @dataclass
@@ -31,7 +30,7 @@ class OODResult:
     seq_id: int
     user_id: int
     length: int
-    result_type: str            # "ID" | "Hard_OOD" | "Soft_OOD"
+    result_type: str            # "ID" | "Hard_OOD" | "Soft_OOD" | "Causal_OOD"
     first_bad_step: int         # -1 if none
     score: float                # anomaly score (NLL)
     visited_nodes: int
@@ -39,27 +38,49 @@ class OODResult:
 
 
 class TrieOODDetector:
-    """
-    Uses a trained BayesianTrie to score a sequence.
-    """
+    """Uses a trained BayesianTrie to score a sequence."""
     def __init__(self, trie: BayesianTrie, soft_threshold: float = 10.0, clamp_eps: float = 1e-12):
         self.trie = trie
         self.soft_threshold = float(soft_threshold)
         self.clamp_eps = float(clamp_eps)
 
+    def detect_causal_ood(self, seq: List[Any]) -> bool:
+        """
+        Rule-based Causal / Logic OOD detection.
+        seq: List[(cluster_id, type_code, ...)]
+        """
+        if not seq:
+            return False
+
+        type_codes = [x[1] for x in seq]  # second field is type_code
+
+        # Rule 1: strong stage reversal (e.g., 4 -> 1, 3 -> 1)
+        for i in range(1, len(type_codes)):
+            if type_codes[i - 1] - type_codes[i] >= 2:
+                return True
+
+        # Rule 2: too-early purchase (buy happens in first 2 steps)
+        if 4 in type_codes:
+            first_buy_pos = type_codes.index(4)
+            if first_buy_pos <= 1:
+                return True
+
+        return False
+
     def predict(self, seq: Iterable[Any]) -> Tuple[str, int, float, int]:
         """
         Returns: (result_type, first_bad_step, score, visited_nodes)
 
-        - If a step is missing -> Hard_OOD, score is partial NLL up to before missing
-        - Else compute full score:
-            score > soft_threshold -> Soft_OOD
-            else -> ID
+        Priority:
+          Hard_OOD -> Causal_OOD -> Soft_OOD -> ID
         """
         ok, miss_i, score, visited = self.trie.neg_loglik(seq, clamp_eps=self.clamp_eps)
 
         if not ok:
             return "Hard_OOD", int(miss_i), float(score), int(visited)
+
+        if self.detect_causal_ood(list(seq) if not isinstance(seq, list) else seq):
+            return "Causal_OOD", -1, float(score), int(visited)
 
         if score > self.soft_threshold:
             return "Soft_OOD", -1, float(score), int(visited)
@@ -67,7 +88,7 @@ class TrieOODDetector:
         return "ID", -1, float(score), int(visited)
 
 
-def iter_user_sequences_with_uid(path: str) -> Iterable[Tuple[int, List[List[int]]]]:
+def iter_user_sequences_with_uid(path: str):
     """
     Yields (user_id, seq) for each line:
       {"user_id": ..., "seq": [[cat, type_code, ts], ...]}
@@ -85,27 +106,10 @@ def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 
-def percentile(sorted_vals: List[float], q: float) -> float:
-    """
-    q in [0,1], expects sorted list.
-    """
-    if not sorted_vals:
-        return 0.0
-    if q <= 0:
-        return float(sorted_vals[0])
-    if q >= 1:
-        return float(sorted_vals[-1])
-    idx = int(math.ceil(q * len(sorted_vals))) - 1
-    idx = max(0, min(idx, len(sorted_vals) - 1))
-    return float(sorted_vals[idx])
-
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--seq_path",
-        default="data/cluster_data/processed/user_sequences_clustered.jsonl")
-    parser.add_argument("--out_csv", default="results/baseline_ood.csv")
+    parser.add_argument("--seq_path", default="data/cluster_data/processed/user_sequences_clustered.jsonl")
+    parser.add_argument("--out_csv", default="results/baseline/baseline_ood.csv")
     parser.add_argument("--train_ratio", type=float, default=0.8)
 
     # build trie
@@ -117,10 +121,9 @@ def main():
     parser.add_argument("--soft_th", type=float, default=10.0)
 
     args = parser.parse_args()
-
     ensure_dir(os.path.dirname(args.out_csv) or ".")
 
-    # 1) load all (uid, seq) once
+    # 1) load all data once
     all_data = list(iter_user_sequences_with_uid(args.seq_path))
     all_users = sorted({uid for uid, _ in all_data})
 
@@ -143,22 +146,22 @@ def main():
     for _, seq in train_data:
         trie.insert(seq)
 
-    print(
-        f"[OK] built trie with TRAIN users: {len(train_users)}  train_sequences: {len(train_data)} (root.count={trie.root.count})")
+    print(f"[OK] built trie with TRAIN users: {len(train_users)}  train_sequences: {len(train_data)} (root.count={trie.root.count})")
     print(f"[OK] TEST users: {len(test_users)}  test_sequences: {len(test_data)}")
 
     # 4) score TEST only
     detector = TrieOODDetector(trie, soft_threshold=args.soft_th)
 
-    rows = []
-    scores = []
-    type_counts = {"ID": 0, "Hard_OOD": 0, "Soft_OOD": 0}
+    rows: List[OODResult] = []
+    scores: List[float] = []
+    time_ms_list: List[float] = []
+    type_counts = {"ID": 0, "Hard_OOD": 0, "Soft_OOD": 0, "Causal_OOD": 0}
 
-    t0 = time.perf_counter()
+    t0 = perf_counter()
     for seq_id, (uid, seq) in enumerate(test_data):
-        start = time.perf_counter()
+        start = perf_counter()
         result_type, first_bad, score, visited = detector.predict(seq)
-        time_ms = (time.perf_counter() - start) * 1000.0
+        time_ms = elapsed_ms(start)
 
         rows.append(
             OODResult(
@@ -172,12 +175,14 @@ def main():
                 time_ms=time_ms,
             )
         )
-        type_counts[result_type] += 1
+
+        type_counts[result_type] = type_counts.get(result_type, 0) + 1
         scores.append(score)
+        time_ms_list.append(time_ms)
 
-    total_ms = (time.perf_counter() - t0) * 1000.0
+    total_ms = elapsed_ms(t0)
 
-    # 3) write csv
+    # 5) write csv
     with open(args.out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["seq_id", "user_id", "length", "result_type", "first_bad_step", "score", "visited_nodes", "time_ms"])
@@ -185,14 +190,14 @@ def main():
             w.writerow([r.seq_id, r.user_id, r.length, r.result_type, r.first_bad_step,
                         f"{r.score:.6f}", r.visited_nodes, f"{r.time_ms:.3f}"])
 
-    # 4) print summary
-    scores_sorted = sorted(scores)
-    avg_score = sum(scores_sorted) / len(scores_sorted) if scores_sorted else 0.0
+    # 6) print summary
+    score_stat = summarize(scores)
+    time_stat = summarize(time_ms_list)
 
     print(f"[OK] scored sequences: {len(rows)}  total_time_ms={total_ms:.1f}")
     print("counts:", type_counts)
-    print(f"score mean={avg_score:.4f}  p50={percentile(scores_sorted, 0.50):.4f}  "
-          f"p95={percentile(scores_sorted, 0.95):.4f}  max={scores_sorted[-1]:.4f}" if scores_sorted else "score: empty")
+    print(f"score mean={score_stat['mean']:.4f}  p50={score_stat['p50']:.4f}  p95={score_stat['p95']:.4f}  max={score_stat['max']:.4f}")
+    print(f"time  mean={time_stat['mean']:.3f}ms  p50={time_stat['p50']:.3f}ms  p95={time_stat['p95']:.3f}ms  max={time_stat['max']:.3f}ms")
     print(f"[OK] saved: {args.out_csv}")
 
 
